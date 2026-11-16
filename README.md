@@ -169,6 +169,95 @@ python check\_deps.py
 Expected output (abridged):
 
 ```
+
+## 📦 Download Model Weights
+
+This repository ships **code only**. The 7 trained model files must be
+downloaded separately from the **GitHub Releases** page and placed in a
+`models/` folder at the repo root.
+
+### Why not in the repo?
+
+Model weights are 20–50 MB each. Including them in git history would:
+- Hit GitHub's 100 MB per-file limit
+- Permanently bloat every `git clone`
+- Burn through Git LFS bandwidth quotas
+
+So the code lives here, and the weights live in Releases. Clone is fast (~1 MB), and models download in one command.
+
+### Required model files
+
+| File | Purpose | Size |
+|---|---|---|
+| `bubble_best.pt` | YOLO bubble + character detector | ~22 MB |
+| `panel_best.pt` | YOLO manga panel detector | ~22 MB |
+| `face_best.pt` | YOLO manga face detector | ~22 MB |
+| `sgg_relation_model.pth` | Scene-graph embedding model | ~1 MB |
+| `relation_classifier3.pth` | Text↔character relation classifier | ~50 KB |
+| `face_embedding_model.pth` | Face embedding (character identification) | ~1–5 MB |
+| `manga_embedding_model2.pth` | Manga-specific embedding (DASS) | ~1–5 MB |
+
+**Total: ~70–80 MB**
+
+### Option A — Automatic download (recommended)
+
+After cloning the repo, run:
+
+```bash
+python scripts/download_models.py
+```
+
+The script downloads all 7 files from the latest GitHub Release into `models/`.
+
+### Option B — Manual download
+
+1. Open the [Releases page](https://github.com/FrownUp/manga_translator_hub/releases)
+2. Download the latest release's assets (the 7 `.pt` / `.pth` files)
+3. Create a `models/` folder at the repo root if it doesn't exist:
+   ```bash
+   mkdir models
+   ```
+4. Move or copy all 7 downloaded files into `models/`
+
+### Verify the setup
+
+```bash
+python model_paths.py
+```
+
+Expected output:
+
+```
+MODEL_DIR = /path/to/manga_translator_hub/models
+
+  ✓ bubble_best.pt  (./models/bubble_best.pt)
+  ✓ panel_best.pt  (./models/panel_best.pt)
+  ✓ face_best.pt  (./models/face_best.pt)
+  ✓ sgg_relation_model.pth  (./models/sgg_relation_model.pth)
+  ✓ relation_classifier3.pth  (./models/relation_classifier3.pth)
+  ✓ face_embedding_model.pth  (./models/face_embedding_model.pth)
+  ✓ manga_embedding_model2.pth  (./models/manga_embedding_model2.pth)
+```
+
+All ✓ → you're ready to run `python magi_server.py`.
+
+### Expected folder layout after download
+
+```
+manga_translator_hub/
+├── magi_server.py
+├── manga_pipeline.py
+├── model_paths.py
+├── ...
+└── models/
+    ├── bubble_best.pt
+    ├── panel_best.pt
+    ├── face_best.pt
+    ├── sgg_relation_model.pth
+    ├── relation_classifier3.pth
+    ├── face_embedding_model.pth
+    └── manga_embedding_model2.pth
+```
 ======================================================================
 Python 3.12.10  @  C:\\path\\to\\venv\\Scripts\\python.exe
 ======================================================================
