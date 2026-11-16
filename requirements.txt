@@ -1,0 +1,56 @@
+# ============================================================
+# manga_translator_hub — pinned dependencies
+# Captured: 2026-11-15
+# Python:   3.12.10  (E:\py\venv\Scripts\python.exe)
+# Platform: Windows / CUDA 12.8
+# ============================================================
+
+# ── Web / API ────────────────────────────────────────────────
+fastapi==0.115.6
+uvicorn==0.34.0
+starlette==0.41.3
+pydantic==2.10.3
+requests==2.34.2
+nest-asyncio==1.6.0
+
+# ── Core ML framework (CUDA 12.8 build) ──────────────────────
+torch==2.10.0+cu128
+torchvision==0.25.0+cu128
+
+# ── Vision / ML ──────────────────────────────────────────────
+numpy==2.2.0
+opencv-python==4.10.0.84
+Pillow==12.2.0
+ultralytics==8.3.36
+scikit-learn==1.5.2
+scikit-image==0.24.0
+transformers==4.49.0
+joblib==1.4.2
+
+# ── NLP / Translation ────────────────────────────────────────
+spacy==3.8.2
+deep-translator==1.11.4
+
+# ── Language detection (both present; keep both or pick one) ─
+lingua-language-detector==2.0.2
+langdetect==1.0.9
+
+# ── Browser automation ───────────────────────────────────────
+selenium==4.27.1
+webdriver-manager==4.0.2
+
+# ── SVG rasterizer (used by magi_server.base64_to_cv2) ───────
+cairosvg==2.8.2
+
+# ── OCR backends (all four are installed & used by OCRFusion) ─
+easyocr==1.7.2
+manga-ocr==0.1.14
+pytesseract==0.3.13
+paddleocr==3.5.0
+paddlenlp==2.6.1
+
+# ── Inpainting / diffusion ───────────────────────────────────
+diffusers==0.29.0
+accelerate==1.13.0
+safetensors==0.8.0
+# lama-cleaner==1.x       # NOT INSTALLED — see notes below
