@@ -1,0 +1,53 @@
+# ── Model weights ──
+models/*.pt
+models/*.pth
+models/*.ckpt
+models/*.safetensors
+models/*.onnx
+models/*.bin
+!models/README.md
+!models/.gitkeep
+
+# ── User data ──
+ocr_data_set/
+batch_output/
+debug_image.jpg
+*.log
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ── Virtual envs ──
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── OS junk ──
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Dev-only files (keep on disk, don't push) ──
+find_missing.py
+check_deps.py
+directory_map.py
+magi_server2.py
+translator2.py
+upload_to_github.py
+fix_manga_pipeline.py
+fix_magi_server.py
+restore_files.py
+*.txt
