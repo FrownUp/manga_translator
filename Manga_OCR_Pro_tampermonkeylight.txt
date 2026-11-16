@@ -1,0 +1,1979 @@
+// ==UserScript==
+// @name         Manga OCR Pro (MAGI Integration Enhanced) - Optimized & Robust
+// @namespace    http://tampermonkey.net/
+// @version      13.1
+// @description  Integrated MAGI pipeline with enhanced performance, memory management, and reliability
+// @author       ChatGPT & Assistant
+// @match        *://comick.io/comic/*
+// @match        *://example.com/manga/*
+// @match        *://comic.naver.com/webtoon/*
+// @match        *://preview.redd.it/*
+// @match        *://battwo.com/*
+// @match        *://n08.mimojp.store/*
+// @match        *://rawkuma.com/*
+// @match        *://mangadop.net/*
+// @match        *://naruto-manga-raw.blogspot.com/*
+// @match        *://rawkuma.net/*
+// @match        *://cdn.kumacdn.club/*
+// @match        *://nhentai.net/g/*
+// @match        *://www.colamanga.com/*
+// @match        *://to-corona-ex.com/episodes/*
+// @match        *://wfwf443.com/*
+// @match        *://klz9.com/*
+// @match        *://gomuraw.com/manga/*
+// @match        *://raw.senmanga.com/*
+// @match        *://mangaraw.ad/manga/*
+// @match        *://mangarawjp.me/manga/*
+// @match        *://comic-walker.com/*
+// @match        *://newtoki468.com/webtoon/*
+// @match        *://www.dm5.com/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_addStyle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @require      https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // Configuration Management
+    const APP_CONFIG = {
+        MAGI_API: {
+            DETECT: 'http://localhost:5000/detect',
+            EMBED: 'http://localhost:5000/embeddings',
+            OCR: 'http://localhost:5000/ocr',
+            CORRECTION: 'http://localhost:5000/correction',
+            TIMEOUT: 30000,
+            HEALTH_CHECK_INTERVAL: 60000
+        },
+        CORS_PROXY: 'http://localhost:3000/api/image-to-base64',
+        WEBSITE_STRUCTURE_API: 'http://localhost:5000/analyze_website',
+
+        PROCESSING: {
+            BATCH_SIZE: 3,
+            DEBOUNCE_MS: 500,
+            MAX_RETRIES: 3,
+            LAZY_LOAD_MARGIN: '200px',
+            MAX_CONCURRENT_PROCESSING: 2
+        },
+
+        UI: {
+            OVERLAY_MAX_WIDTH: 300,
+            OVERLAY_OPACITY: 0.95,
+            Z_INDEX: 10000,
+            CONTROL_PANEL_WIDTH: 280
+        },
+
+        CACHE: {
+            MAX_IMAGES: 50,
+            EMBEDDING_TTL: 3600000, // 1 hour
+            CLEANUP_INTERVAL: 300000 // 5 minutes
+        },
+
+        LANGUAGES: {
+            'eng': {name: 'English', icon: '🇺🇸'},
+            'jpn': {name: 'Japanese', icon: '🇯🇵'},
+            'kor': {name: 'Korean', icon: '🇰🇷'},
+            'chi_sim': {name: 'Chinese', icon: '🇨🇳'},
+            'spa': {name: 'Spanish', icon: '🇪🇸'},
+            'por': {name: 'Portuguese', icon: '🇵🇹'},
+            'deu': {name: 'German', icon: '🇩🇪'},
+            'ind': {name: 'Indonesian', icon: '🇮🇩'},
+            'ru': {name: 'Russian', icon: 'RU'}
+        },
+
+        DEFAULT_LANG: 'jpn',
+        CONFIDENCE_THRESHOLD: 70,
+        SIMILARITY_THRESHOLD: 0.7
+    };
+
+    // Enhanced Cache with TTL and Size Limits
+    class ImageDataCache {
+        constructor(maxSize = APP_CONFIG.CACHE.MAX_IMAGES) {
+            this.cache = new WeakMap();
+            this.keys = new Set();
+            this.maxSize = maxSize;
+            this.creationTimes = new WeakMap();
+        }
+
+        set(key, value) {
+            if (this.keys.size >= this.maxSize) {
+                const firstKey = this.keys.values().next().value;
+                this.cache.delete(firstKey);
+                this.creationTimes.delete(firstKey);
+                this.keys.delete(firstKey);
+            }
+            this.cache.set(key, value);
+            this.creationTimes.set(key, Date.now());
+            this.keys.add(key);
+        }
+
+        get(key) {
+            return this.cache.get(key);
+        }
+
+        cleanup(ttl = APP_CONFIG.CACHE.EMBEDDING_TTL) {
+            const now = Date.now();
+            for (const key of this.keys) {
+                const creationTime = this.creationTimes.get(key);
+                if (creationTime && (now - creationTime) > ttl) {
+                    this.cache.delete(key);
+                    this.creationTimes.delete(key);
+                    this.keys.delete(key);
+                }
+            }
+        }
+    }
+
+    const imageDataCache = new ImageDataCache();
+
+    // Connection Health Monitoring
+    class ConnectionMonitor {
+        constructor() {
+            this.isBackendHealthy = true;
+            this.failures = 0;
+            this.maxFailures = 3;
+            this.responseTimes = [];
+            this.healthCheckInterval = null;
+        }
+
+        async checkHealth() {
+            try {
+                const testImage = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+                const startTime = performance.now();
+
+                await magiRequestWithRetry(APP_CONFIG.MAGI_API.DETECT, {
+                    image: testImage
+                }, 1); // Single retry for health check
+
+                const responseTime = performance.now() - startTime;
+                this.responseTimes.push(responseTime);
+
+                // Keep only last 10 measurements
+                if (this.responseTimes.length > 10) {
+                    this.responseTimes.shift();
+                }
+
+                this.failures = 0;
+                this.isBackendHealthy = true;
+                return {
+                    healthy: true,
+                    responseTime,
+                    averageResponseTime: this.responseTimes.reduce((a, b) => a + b, 0) / this.responseTimes.length
+                };
+            } catch (error) {
+                this.failures++;
+                this.isBackendHealthy = this.failures < this.maxFailures;
+                return {
+                    healthy: false,
+                    error: error.message,
+                    failures: this.failures
+                };
+            }
+        }
+
+        startPeriodicChecks() {
+            this.healthCheckInterval = setInterval(() => {
+                this.checkHealth().then(health => {
+                    if (!health.healthy) {
+                        console.warn('MAGI backend health check failed:', health.error);
+                    }
+                });
+            }, APP_CONFIG.MAGI_API.HEALTH_CHECK_INTERVAL);
+        }
+
+        stopPeriodicChecks() {
+            if (this.healthCheckInterval) {
+                clearInterval(this.healthCheckInterval);
+                this.healthCheckInterval = null;
+            }
+        }
+
+        getHealth() {
+            return {
+                healthy: this.isBackendHealthy,
+                failures: this.failures,
+                averageResponseTime: this.responseTimes.length ?
+                    this.responseTimes.reduce((a, b) => a + b, 0) / this.responseTimes.length : 0
+            };
+        }
+    }
+
+    const connectionMonitor = new ConnectionMonitor();
+
+    // Enhanced MAGI API request with retry logic
+    async function magiRequestWithRetry(url, data, maxRetries = APP_CONFIG.PROCESSING.MAX_RETRIES) {
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                const result = await magiRequest(url, data);
+                return result;
+            } catch (error) {
+                if (attempt === maxRetries) {
+                    throw new Error(`MAGI request failed after ${maxRetries} attempts: ${error.message}`);
+                }
+
+                console.warn(`MAGI request failed, retrying... (${attempt}/${maxRetries})`);
+
+                // Exponential backoff
+                const backoffTime = 1000 * Math.pow(2, attempt - 1);
+                await new Promise(resolve => setTimeout(resolve, backoffTime));
+            }
+        }
+    }
+
+    // MAGI backend connection
+    const magiBackend = {
+        detectComponents: async (img) => {
+            const base64 = await getImageBase64(img);
+            return magiRequestWithRetry(APP_CONFIG.MAGI_API.DETECT, {image: base64});
+        },
+
+        getCharacterEmbeddings: async (img, char_bboxes, text_bboxes = []) => {
+            const base64 = await getImageBase64(img);
+            return magiRequestWithRetry(APP_CONFIG.MAGI_API.EMBED, {
+                image: base64,
+                text_bboxes: text_bboxes,
+                char_bboxes: char_bboxes
+            });
+        },
+
+        ocrTextRegions: async (img, bboxes, lang) => {
+            const base64 = await getImageBase64(img);
+            return magiRequestWithRetry(APP_CONFIG.MAGI_API.OCR, {
+                image: base64,
+                bboxes: bboxes,
+                lang: lang
+            });
+        }
+    };
+
+    // Enhanced overlay positioning system
+    class OverlayPositioningSystem {
+        constructor() {
+            this.overlays = new WeakMap();
+            this.observedContainers = new WeakSet();
+            this.resizeObserver = null;
+            this.intersectionObserver = null;
+            this.mutationObserver = null;
+            this.scrollHandler = null;
+            this.updateTimeouts = new WeakMap();
+            this.globalUpdateTimeout = null;
+        }
+
+        init() {
+            this.setupObservers();
+            this.setupScrollHandler();
+        }
+
+        setupObservers() {
+            // ResizeObserver for container and image size changes
+            this.resizeObserver = new ResizeObserver(entries => {
+                entries.forEach(entry => {
+                    const container = entry.target;
+                    this.updateOverlaysInContainer(container);
+                });
+            });
+
+            // IntersectionObserver for visibility changes
+            this.intersectionObserver = new IntersectionObserver(entries => {
+                entries.forEach(entry => {
+                    if (entry.isIntersecting) {
+                        const container = entry.target;
+                        this.updateOverlaysInContainer(container);
+                    }
+                });
+            }, {
+                threshold: 0.1,
+                rootMargin: '50px' // Update when near viewport
+            });
+
+            // MutationObserver for DOM changes
+            this.mutationObserver = new MutationObserver(mutations => {
+                let needsUpdate = false;
+
+                mutations.forEach(mutation => {
+                    if (mutation.type === 'attributes') {
+                        const target = mutation.target;
+                        if (this.overlays.has(target)) {
+                            this.debouncedUpdate(target);
+                        }
+                    } else if (mutation.addedNodes.length > 0 || mutation.removedNodes.length > 0) {
+                        needsUpdate = true;
+                    }
+                });
+
+                if (needsUpdate) {
+                    this.checkForLayoutChanges();
+                }
+            });
+        }
+
+        setupScrollHandler() {
+            this.scrollHandler = () => {
+                this.debouncedGlobalUpdate();
+            };
+            window.addEventListener('scroll', this.scrollHandler, { passive: true });
+        }
+
+        monitorOverlay(overlay, container, img, bbox, lang) {
+            this.overlays.set(overlay, { container, img, bbox, lang });
+
+            // Start observing the container if not already being observed
+            if (!this.observedContainers.has(container)) {
+                this.resizeObserver.observe(container);
+                this.intersectionObserver.observe(container);
+                this.mutationObserver.observe(container, {
+                    attributes: true,
+                    childList: true,
+                    subtree: true,
+                    attributeFilter: ['style', 'class', 'id']
+                });
+                this.observedContainers.add(container);
+            }
+
+            // Initial positioning
+            this.updateOverlayPosition(overlay);
+        }
+
+        updateOverlaysInContainer(container) {
+            const overlays = container.querySelectorAll('.ocr-overlay');
+            overlays.forEach(overlay => {
+                const data = this.overlays.get(overlay);
+                if (data && data.container === container) {
+                    this.updateOverlayPosition(overlay);
+                }
+            });
+        }
+
+        updateOverlayPosition(overlay) {
+            const data = this.overlays.get(overlay);
+            if (!data) return;
+
+            const { container, img, bbox } = data;
+
+            // Validate container and image still exist
+            if (!document.contains(container) || !document.contains(img)) {
+                this.overlays.delete(overlay);
+                overlay.remove();
+                return;
+            }
+
+            try {
+                // Get current image dimensions and position
+                const imgRect = img.getBoundingClientRect();
+                const containerRect = container.getBoundingClientRect();
+
+                // Validate dimensions
+                if (imgRect.width === 0 || imgRect.height === 0 ||
+                    containerRect.width === 0 || containerRect.height === 0) {
+                    return;
+                }
+
+                // Calculate scaling factors
+                const scaleX = imgRect.width / Math.max(img.naturalWidth, 1);
+                const scaleY = imgRect.height / Math.max(img.naturalHeight, 1);
+
+                // Apply scaling to original bbox
+                const scaledLeft = bbox[0] * imgRect.width;
+                const scaledTop = bbox[1] * imgRect.height;
+                const scaledWidth = Math.max((bbox[2] - bbox[0]) * imgRect.width, 10); // Minimum width
+                const scaledHeight = Math.max((bbox[3] - bbox[1]) * imgRect.height, 10); // Minimum height
+
+                // Calculate final position relative to container
+                const containerX = containerRect.left - imgRect.left;
+                const containerY = containerRect.top - imgRect.top;
+
+                const finalLeft = Math.max(0, scaledLeft + containerX);
+                const finalTop = Math.max(0, scaledTop + containerY);
+                const finalWidth = Math.min(scaledWidth, containerRect.width - finalLeft);
+                const finalHeight = Math.min(scaledHeight, containerRect.height - finalTop);
+
+                // Validate final dimensions
+                if (finalWidth <= 0 || finalHeight <= 0) {
+                    overlay.style.display = 'none';
+                    return;
+                }
+
+                // Apply positioning
+                overlay.style.left = `${finalLeft}px`;
+                overlay.style.top = `${finalTop}px`;
+                overlay.style.width = `${finalWidth}px`;
+                overlay.style.minHeight = `${finalHeight}px`;
+                overlay.style.display = 'block';
+
+                // Check for collisions with page elements
+                this.avoidElementCollisions(overlay, container);
+            } catch (error) {
+                console.warn('Error updating overlay position:', error);
+            }
+        }
+
+        avoidElementCollisions(overlay, container) {
+            try {
+                const overlayRect = overlay.getBoundingClientRect();
+
+                // Get all potentially colliding elements (limit to reasonable scope)
+                const pageElements = document.elementsFromPoint(
+                    overlayRect.left + overlayRect.width / 2,
+                    overlayRect.top + overlayRect.height / 2
+                );
+
+                let hasCollision = false;
+
+                for (const element of pageElements) {
+                    if (element === overlay || element === container ||
+                        element.contains(overlay) || overlay.contains(element)) {
+                        continue;
+                    }
+
+                    const elementRect = element.getBoundingClientRect();
+
+                    if (this.elementsOverlap(overlayRect, elementRect)) {
+                        this.adjustOverlayForCollision(overlay, elementRect, container);
+                        hasCollision = true;
+                        break;
+                    }
+                }
+
+                // Reset opacity if no collisions
+                if (!hasCollision) {
+                    overlay.style.opacity = '';
+                }
+            } catch (error) {
+                console.warn('Error in collision avoidance:', error);
+            }
+        }
+
+        elementsOverlap(rect1, rect2) {
+            return !(
+                rect1.right < rect2.left ||
+                rect1.left > rect2.right ||
+                rect1.bottom < rect2.top ||
+                rect1.top > rect2.bottom
+            );
+        }
+
+        adjustOverlayForCollision(overlay, obstacleRect, container) {
+            const overlayRect = overlay.getBoundingClientRect();
+            const containerRect = container.getBoundingClientRect();
+
+            // Try different positioning strategies
+            const strategies = [
+                // Right side of obstacle
+                { x: obstacleRect.right + 5, y: overlayRect.top },
+                // Below obstacle
+                { x: overlayRect.left, y: obstacleRect.bottom + 5 },
+                // Left side of obstacle
+                { x: obstacleRect.left - overlayRect.width - 5, y: overlayRect.top },
+                // Above obstacle
+                { x: overlayRect.left, y: obstacleRect.top - overlayRect.height - 5 }
+            ];
+
+            // Find the first valid position
+            for (const position of strategies) {
+                if (this.isPositionValid(position, overlayRect, containerRect)) {
+                    // Convert to relative coordinates within container
+                    const relativeX = position.x - containerRect.left;
+                    const relativeY = position.y - containerRect.top;
+
+                    overlay.style.left = `${relativeX}px`;
+                    overlay.style.top = `${relativeY}px`;
+                    overlay.style.opacity = '0.9';
+                    return;
+                }
+            }
+
+            // If no valid position found, reduce opacity
+            overlay.style.opacity = '0.8';
+        }
+
+        isPositionValid(position, overlayRect, containerRect) {
+            const testRect = {
+                left: position.x,
+                top: position.y,
+                right: position.x + overlayRect.width,
+                bottom: position.y + overlayRect.height
+            };
+
+            // Check if within container bounds
+            const withinContainer = (
+                testRect.left >= containerRect.left &&
+                testRect.top >= containerRect.top &&
+                testRect.right <= containerRect.right &&
+                testRect.bottom <= containerRect.bottom
+            );
+
+            // Check if within viewport
+            const withinViewport = (
+                testRect.left >= 0 &&
+                testRect.top >= 0 &&
+                testRect.right <= window.innerWidth &&
+                testRect.bottom <= window.innerHeight
+            );
+
+            return withinContainer && withinViewport;
+        }
+
+        debouncedUpdate(overlay) {
+            clearTimeout(this.updateTimeouts.get(overlay));
+            const timeout = setTimeout(() => {
+                this.updateOverlayPosition(overlay);
+            }, 100);
+            this.updateTimeouts.set(overlay, timeout);
+        }
+
+        debouncedGlobalUpdate() {
+            clearTimeout(this.globalUpdateTimeout);
+            this.globalUpdateTimeout = setTimeout(() => {
+                this.updateAllOverlayPositions();
+            }, 150);
+        }
+
+        updateAllOverlayPositions() {
+            document.querySelectorAll('.ocr-overlay').forEach(overlay => {
+                this.updateOverlayPosition(overlay);
+            });
+        }
+
+        checkForLayoutChanges() {
+            this.debouncedGlobalUpdate();
+        }
+
+        destroy() {
+            if (this.resizeObserver) this.resizeObserver.disconnect();
+            if (this.intersectionObserver) this.intersectionObserver.disconnect();
+            if (this.mutationObserver) this.mutationObserver.disconnect();
+            if (this.scrollHandler) window.removeEventListener('scroll', this.scrollHandler);
+
+            // Clear all timeouts
+            for (const timeout of Object.values(this.updateTimeouts)) {
+                clearTimeout(timeout);
+            }
+            clearTimeout(this.globalUpdateTimeout);
+        }
+    }
+
+    // Initialize the enhanced positioning system
+    const positioningSystem = new OverlayPositioningSystem();
+
+    // MAGI API request helper
+    function magiRequest(url, data) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url: url,
+                data: JSON.stringify(data),
+                headers: {'Content-Type': 'application/json'},
+                timeout: APP_CONFIG.MAGI_API.TIMEOUT,
+                onload: (res) => {
+                    if (res.status >= 200 && res.status < 300) {
+                        try {
+                            resolve(JSON.parse(res.responseText));
+                        } catch (e) {
+                            reject(new Error(`Failed to parse response: ${e.message}`));
+                        }
+                    } else {
+                        reject(new Error(`HTTP ${res.status}: ${res.statusText}`));
+                    }
+                },
+                onerror: (err) => reject(new Error(`Network error: ${err.statusText}`)),
+                ontimeout: () => reject(new Error('Request timeout'))
+            });
+        });
+    }
+
+    // Enhanced image validation and base64 conversion
+    async function getImageBase64(img) {
+        // Validate image
+        if (!img || !img.src) {
+            throw new Error('Invalid image element');
+        }
+
+        // Use proxy only for cross-origin images
+        if (img.src.startsWith('data:') ||
+            img.src.startsWith('blob:') ||
+            new URL(img.src, window.location.href).origin === location.origin) {
+
+            return new Promise((resolve, reject) => {
+                if (!img.complete || img.naturalHeight === 0) {
+                    reject(new Error('Image not loaded'));
+                    return;
+                }
+
+                try {
+                    const canvas = document.createElement('canvas');
+                    const ctx = canvas.getContext('2d');
+                    canvas.width = img.naturalWidth;
+                    canvas.height = img.naturalHeight;
+                    ctx.drawImage(img, 0, 0);
+                    resolve(canvas.toDataURL('image/png'));
+                } catch (error) {
+                    reject(new Error(`Canvas conversion failed: ${error.message}`));
+                }
+            });
+        }
+
+        // Use proxy for cross-origin images
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url: APP_CONFIG.CORS_PROXY,
+                data: JSON.stringify({ imageUrl: img.src }),
+                headers: {'Content-Type': 'application/json'},
+                timeout: 15000,
+                onload: (res) => {
+                    try {
+                        const data = JSON.parse(res.responseText);
+                        if (data.base64) {
+                            resolve(data.base64);
+                        } else {
+                            reject(new Error('No base64 data in response'));
+                        }
+                    } catch (e) {
+                        reject(new Error(`Proxy response parsing failed: ${e.message}`));
+                    }
+                },
+                onerror: (err) => {
+                    reject(new Error(`CORS proxy failed: ${err.statusText}`));
+                },
+                ontimeout: () => {
+                    reject(new Error('CORS proxy timeout'));
+                }
+            });
+        });
+    }
+
+    // Enhanced Character Mapper with persistence
+    class CharacterMapper {
+        constructor() {
+            this.clusterToSpeaker = {};
+            this.nextSpeakerId = 1;
+            this.storedEmbeds = {};
+            this.loadFromStorage();
+        }
+
+        loadFromStorage() {
+            try {
+                const stored = GM_getValue('character_mapper_data');
+                if (stored) {
+                    const data = JSON.parse(stored);
+                    this.clusterToSpeaker = data.clusterToSpeaker || {};
+                    this.nextSpeakerId = data.nextSpeakerId || 1;
+                    this.storedEmbeds = data.storedEmbeds || {};
+                }
+            } catch (error) {
+                console.warn('Failed to load character mapper from storage:', error);
+            }
+        }
+
+        saveToStorage() {
+            try {
+                GM_setValue('character_mapper_data', JSON.stringify({
+                    clusterToSpeaker: this.clusterToSpeaker,
+                    nextSpeakerId: this.nextSpeakerId,
+                    storedEmbeds: this.storedEmbeds
+                }));
+            } catch (error) {
+                console.warn('Failed to save character mapper to storage:', error);
+            }
+        }
+
+        getSpeaker(embeddings) {
+            const globalId = this.findBestMatch(embeddings);
+
+            if (!this.clusterToSpeaker[globalId]) {
+                this.clusterToSpeaker[globalId] = `CHAR${this.nextSpeakerId++}`;
+                this.saveToStorage();
+            }
+            return this.clusterToSpeaker[globalId];
+        }
+
+        findBestMatch(embedding) {
+            // Validation
+            if (!Array.isArray(embedding) || embedding.length === 0) {
+                return this.createNewCharacter(embedding);
+            }
+
+            // First character storage
+            if (Object.keys(this.storedEmbeds).length === 0) {
+                const newId = 1;
+                this.storedEmbeds[newId] = embedding;
+                this.saveToStorage();
+                return newId;
+            }
+
+            // Compare to stored embeddings
+            let bestId = null;
+            let bestSimilarity = 0;
+
+            for (const [id, storedEmbeds] of Object.entries(this.storedEmbeds)) {
+                const similarity = this.cosineSimilarity(embedding, storedEmbeds);
+                if (similarity > bestSimilarity && similarity > APP_CONFIG.SIMILARITY_THRESHOLD) {
+                    bestSimilarity = similarity;
+                    bestId = parseInt(id);
+                }
+            }
+
+            if (bestId !== null) {
+                return bestId;
+            }
+
+            // New character
+            return this.createNewCharacter(embedding);
+        }
+
+        createNewCharacter(embedding) {
+            const newId = Object.keys(this.storedEmbeds).length + 1;
+            this.storedEmbeds[newId] = embedding;
+            this.saveToStorage();
+            return newId;
+        }
+
+        cosineSimilarity(embedding, storedEmbeds) {
+            // Validation
+            if (!Array.isArray(embedding) || !Array.isArray(storedEmbeds)) {
+                return 0;
+            }
+            if (embedding.length !== storedEmbeds.length) {
+                return 0;
+            }
+
+            // Calculate dot product
+            let dot = 0;
+            for (let i = 0; i < embedding.length; i++) {
+                dot += embedding[i] * storedEmbeds[i];
+            }
+
+            // Calculate magnitudes
+            let magA = 0;
+            let magB = 0;
+            for (let i = 0; i < embedding.length; i++) {
+                magA += embedding[i] * embedding[i];
+                magB += storedEmbeds[i] * storedEmbeds[i];
+            }
+            magA = Math.sqrt(magA);
+            magB = Math.sqrt(magB);
+
+            // Avoid division by zero
+            if (magA === 0 || magB === 0) {
+                return 0;
+            }
+
+            return dot / (magA * magB);
+        }
+
+        clear() {
+            this.clusterToSpeaker = {};
+            this.nextSpeakerId = 1;
+            this.storedEmbeds = {};
+            GM_deleteValue('character_mapper_data');
+        }
+    }
+
+    let globalCharacterMapper = null;
+
+    function getCharacterMapper() {
+        if (!globalCharacterMapper) {
+            globalCharacterMapper = new CharacterMapper();
+        }
+        return globalCharacterMapper;
+    }
+
+    // Enhanced language detection
+    function detectLanguageWithConfidence(text) {
+        if (!text || text.length < 3) return { lang: 'eng', confidence: 0 };
+
+        const patterns = {
+            'jpn': [/[ぁ-ん]/, /[ァ-ン]/, /[一-龯]/], // Hiragana, Katakana, Kanji
+            'kor': [/[\uAC00-\uD7AF]/], // Hangul
+            'chi_sim': [/[\u4E00-\u9FFF]/], // Chinese
+            'ru': [/[А-Яа-яЁё]/], // Cyrillic
+            'eng': [/[a-zA-Z]/] // English
+        };
+
+        let bestLang = 'eng';
+        let bestScore = 0;
+
+        for (const [lang, langPatterns] of Object.entries(patterns)) {
+            let score = 0;
+            for (const pattern of langPatterns) {
+                const matches = text.match(pattern);
+                if (matches) score += matches.length;
+            }
+
+            if (score > bestScore) {
+                bestScore = score;
+                bestLang = lang;
+            }
+        }
+
+        const confidence = Math.min(bestScore / text.length, 1);
+        return { lang: bestLang, confidence };
+    }
+
+    // Text processing utilities
+    function cleanText(text, lang) {
+        if (typeof text !== 'string') return '';
+
+        // Common punctuation and symbols
+        const basePattern = 'A-Za-z0-9\\s.,!?\'"\\-—「」『』（）«»„“”';
+
+        // Language-specific Unicode ranges
+        let langRanges = '';
+
+        switch (lang) {
+            case 'ru': // Cyrillic
+                langRanges = '\\u0400-\\u04FF';
+                break;
+            case 'chi_sim': // Chinese
+                langRanges = '\\u4E00-\\u9FFF';
+                break;
+            case 'jpn': // Japanese
+                langRanges = [
+                    '\\u3040-\\u309F', // Hiragana
+                    '\\u30A0-\\u30FF', // Katakana
+                    '\\u31F0-\\u31FF', // Katakana Extensions
+                    '\\u4E00-\\u9FFF', // Kanji
+                    '\\uFF66-\\uFF9D'  // Half-width Katakana
+                ].join('');
+                break;
+            case 'kor': // Korean
+                langRanges = '\\uAC00-\\uD7AF';
+                break;
+            default:
+                langRanges = '';
+        }
+
+        const whitelistRegex = new RegExp(`[^${basePattern}${langRanges}]`, 'gu');
+        const multiSpaceRegex = /\s+/g;
+
+        return text
+            .replace(whitelistRegex, ' ')
+            .replace(multiSpaceRegex, ' ')
+            .trim();
+    }
+
+    function formatText(text) {
+        if (!text) return '';
+        const trimmed = text.trim();
+        if (trimmed.length === 0) return '';
+        return trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
+    }
+
+    // Text-character association
+    function associateTextToCharacters(texts, characters, panels, readingOrder = "manga") {
+        const associations = [];
+
+        panels.forEach(panel => {
+            const panelBbox = panel.bbox;
+
+            // Find characters in panel
+            const panelChars = characters.filter(char =>
+                isInside(char.bbox, panelBbox)
+            );
+
+            // Find texts in panel
+            const panelTexts = texts.filter(text =>
+                isInside(text.bbox, panelBbox)
+            );
+
+            // Associate each text to nearest character
+            panelTexts.forEach(text => {
+                let minDist = Infinity;
+                let closestChar = null;
+
+                panelChars.forEach(char => {
+                    let dist = bboxDistance(text.bbox, char.bbox);
+
+                    // Manga reading order preference (right side)
+                    if (readingOrder === "manga") {
+                        const textCenter = (text.bbox[0] + text.bbox[2]) / 2;
+                        const charCenter = (char.bbox[0] + char.bbox[2]) / 2;
+                        if (textCenter > charCenter) dist *= 0.7;
+                    }
+
+                    if (dist < minDist) {
+                        minDist = dist;
+                        closestChar = char;
+                    }
+                });
+
+                if (closestChar) {
+                    associations.push({
+                        textIndex: texts.indexOf(text),
+                        charIndex: characters.indexOf(closestChar)
+                    });
+                }
+            });
+        });
+
+        return associations;
+    }
+
+    function isInside(inner, outer) {
+        return (
+            inner[0] >= outer[0] &&
+            inner[1] >= outer[1] &&
+            inner[2] <= outer[2] &&
+            inner[3] <= outer[3]
+        );
+    }
+
+    function bboxDistance(a, b) {
+        const aCenter = [(a[0] + a[2]) / 2, (a[1] + a[3]) / 2];
+        const bCenter = [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2];
+        return Math.sqrt(
+            Math.pow(aCenter[0] - bCenter[0], 2) +
+            Math.pow(aCenter[1] - bCenter[1], 2)
+        );
+    }
+
+    // MAGI Processing Pipeline
+    async function magiProcessImage(img, lang, readingOrder) {
+        try {
+            const detection = await magiBackend.detectComponents(img);
+            const panels = detection.panels || [];
+            const texts = detection.bubbles || [];
+            const characters = detection.characters || [];
+
+            if (!Array.isArray(characters) || characters.length === 0) {
+                return {
+                    texts,
+                    characters,
+                    associations: [],
+                    ocrResults: [],
+                    speakerMap: {}
+                };
+            }
+
+            if (!Array.isArray(texts) || texts.length === 0) {
+                return {
+                    texts: [],
+                    characters,
+                    associations: [],
+                    ocrResults: [],
+                    speakerMap: {}
+                };
+            }
+
+            const charBboxes = characters.map(c => c.bbox);
+            const embeddings = await magiBackend.getCharacterEmbeddings(img, charBboxes);
+            const charEmbeddings = embeddings.char_embeddings;
+
+            const associations = associateTextToCharacters(texts, characters, panels, readingOrder);
+            const textBboxes = texts.map(t => t.bbox);
+            const ocrResults = await magiBackend.ocrTextRegions(img, textBboxes, lang);
+
+            const mapper = getCharacterMapper();
+            const speakerMap = {};
+            for (let i = 0; i < characters.length; i++) {
+                speakerMap[i] = mapper.getSpeaker(charEmbeddings[i]);
+            }
+
+            return {
+                texts,
+                characters,
+                associations,
+                ocrResults: ocrResults.results || [],
+                speakerMap
+            };
+        } catch (error) {
+            console.error('MAGI processing failed:', error);
+            throw error;
+        }
+    }
+
+    // SETTINGS MANAGER
+    class SettingsManager {
+        static init() {
+            if (GM_getValue('active') === undefined) {
+                GM_setValue('active', true);
+            }
+            if (!GM_getValue('language')) {
+                GM_setValue('language', APP_CONFIG.DEFAULT_LANG);
+            }
+            if (!GM_getValue('confidence')) {
+                GM_setValue('confidence', APP_CONFIG.CONFIDENCE_THRESHOLD);
+            }
+            if (!GM_getValue('readingOrder')) {
+                GM_setValue('readingOrder', 'manga');
+            }
+            if (GM_getValue('useWebsiteStructure') === undefined) {
+                GM_setValue('useWebsiteStructure', false);
+            }
+        }
+
+        static getUseWebsiteStructure() {
+            return GM_getValue('useWebsiteStructure', false);
+        }
+
+        static setUseWebsiteStructure(value) {
+            GM_setValue('useWebsiteStructure', value);
+        }
+
+        static getActive() {
+            return GM_getValue('active', true);
+        }
+
+        static setActive(value) {
+            GM_setValue('active', value);
+        }
+
+        static getLanguage() {
+            return GM_getValue('language', APP_CONFIG.DEFAULT_LANG);
+        }
+
+        static getConfidence() {
+            return GM_getValue('confidence', APP_CONFIG.CONFIDENCE_THRESHOLD);
+        }
+
+        static getReadingOrder() {
+            return GM_getValue('readingOrder', 'manga');
+        }
+
+        static setLanguage(lang) {
+            GM_setValue('language', lang);
+        }
+
+        static setConfidence(value) {
+            GM_setValue('confidence', value);
+        }
+
+        static setReadingOrder(order) {
+            GM_setValue('readingOrder', order);
+        }
+    }
+
+    // Enhanced Image Processor with concurrency control
+    class ImageProcessor {
+        constructor(app) {
+            this.app = app;
+            this.pendingProcess = new Map();
+            this.processingQueue = new Set();
+            this.currentlyProcessing = new Map();
+            this.maxConcurrent = APP_CONFIG.PROCESSING.MAX_CONCURRENT_PROCESSING;
+        }
+
+        async scheduleProcessing(img, priority = 'normal') {
+            // Cancel existing pending processing for this image
+            if (this.pendingProcess.has(img)) {
+                clearTimeout(this.pendingProcess.get(img));
+            }
+
+            const timeoutId = setTimeout(async () => {
+                this.pendingProcess.delete(img);
+                await this.processImage(img);
+            }, priority === 'high' ? 100 : APP_CONFIG.PROCESSING.DEBOUNCE_MS);
+
+            this.pendingProcess.set(img, timeoutId);
+        }
+
+        async processImage(img) {
+            if (!this.app.active ||
+                this.currentlyProcessing.has(img.src) ||
+                !img.complete ||
+                img.naturalHeight === 0) {
+                return;
+            }
+
+            // Check if already processed
+            if (img.hasAttribute('data-magi-processed')) {
+                return;
+            }
+
+            // Check backend health
+            if (!connectionMonitor.isBackendHealthy) {
+                console.warn('Skipping image processing - backend unhealthy');
+                return;
+            }
+
+            // Limit concurrent processing
+            if (this.currentlyProcessing.size >= this.maxConcurrent) {
+                // Wait for a slot to free up
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                return this.scheduleProcessing(img, 'high');
+            }
+
+            const processingPromise = this.processImageInternal(img);
+            this.currentlyProcessing.set(img.src, processingPromise);
+
+            try {
+                await processingPromise;
+            } finally {
+                this.currentlyProcessing.delete(img.src);
+            }
+        }
+
+        async processImageInternal(img) {
+            try {
+                // Create container if needed
+                let container = img.parentElement;
+                const isNewContainer = !container.classList.contains('magi-container');
+
+                if (isNewContainer) {
+                    container = document.createElement('div');
+                    container.className = 'magi-container';
+                    container.style.position = 'relative';
+                    container.style.display = 'inline-block';
+                    img.parentNode.insertBefore(container, img);
+                    container.appendChild(img);
+                }
+
+                // Remove existing overlays for this image
+                container.querySelectorAll('.ocr-overlay').forEach(el => el.remove());
+
+                img.setAttribute('data-magi-processed', 'true');
+
+                // Process with MAGI
+                const lang = SettingsManager.getLanguage();
+                const readingOrder = SettingsManager.getReadingOrder();
+
+                console.log('Processing image:', img.src);
+                const results = await magiProcessImage(img, lang, readingOrder);
+
+                // Create overlays
+                results.texts.forEach((text, idx) => {
+                    const association = results.associations.find(a => a.textIndex === idx);
+                    let speaker = null;
+
+                    if (association) {
+                        speaker = results.speakerMap[association.charIndex];
+                    }
+
+                    const rawText = results.ocrResults[idx] || '';
+                    const langInfo = detectLanguageWithConfidence(rawText);
+                    const cleanedText = cleanText(rawText, langInfo.lang);
+                    const finalText = formatText(cleanedText);
+
+                    // Only create overlay if text is meaningful
+                    if (finalText.length > 0) {
+                        createOverlay(
+                            finalText,
+                            text.bbox,
+                            container,
+                            speaker,
+                            rawText,
+                            img,
+                            langInfo.lang
+                        );
+                    }
+                });
+
+            } catch (error) {
+                console.error('Image processing failed:', error);
+                // Remove processed flag to allow retry
+                img.removeAttribute('data-magi-processed');
+
+                // Don't retry immediately for server errors
+                if (!error.message.includes('HTTP 5')) {
+                    setTimeout(() => {
+                        this.scheduleProcessing(img, 'high');
+                    }, 5000);
+                }
+            }
+        }
+
+        cleanup() {
+            // Clear all pending timeouts
+            for (const timeout of this.pendingProcess.values()) {
+                clearTimeout(timeout);
+            }
+            this.pendingProcess.clear();
+            this.processingQueue.clear();
+            this.currentlyProcessing.clear();
+        }
+    }
+
+    // Enhanced UI Overlay Creator
+    function createOverlay(text, bbox, container, speaker, rawText, img, lang) {
+        const imgElement = container.querySelector('img');
+        if (!imgElement) return null;
+
+        // Create overlay element
+        const overlay = document.createElement('div');
+        overlay.className = 'ocr-overlay';
+        overlay.dataset.originalText = rawText;
+        overlay.dataset.bbox = JSON.stringify(bbox);
+        overlay.dataset.lang = lang;
+
+        if (speaker) {
+            const speakerEl = document.createElement('div');
+            speakerEl.className = 'speaker-badge';
+            speakerEl.textContent = speaker;
+            speakerEl.style.cssText = `
+                color: #d32f2f;
+                font-weight: bold;
+                margin-bottom: 4px;
+                font-size: 12px;
+                background: rgba(255,255,255,0.9);
+                padding: 2px 6px;
+                border-radius: 3px;
+                display: inline-block;
+            `;
+            overlay.appendChild(speakerEl);
+        }
+
+        // Create text container
+        const textContainer = document.createElement('div');
+        textContainer.className = 'ocr-text';
+        textContainer.textContent = text;
+        overlay.appendChild(textContainer);
+
+        // Add edit button
+        const editButton = document.createElement('button');
+        editButton.className = 'edit-btn';
+        editButton.innerHTML = '<i class="fas fa-edit"></i>';
+        editButton.title = 'Edit translation';
+        editButton.style.cssText = `
+            position: absolute;
+            top: 2px;
+            right: 2px;
+            background: rgba(255,255,255,0.9);
+            border: 1px solid #ddd;
+            border-radius: 3px;
+            cursor: pointer;
+            padding: 2px 5px;
+            z-index: 10;
+            opacity: 0.8;
+            transition: opacity 0.2s;
+            font-size: 10px;
+        `;
+        overlay.appendChild(editButton);
+
+        // Add to container
+        container.appendChild(overlay);
+
+        // Register with positioning system
+        positioningSystem.monitorOverlay(overlay, container, imgElement, bbox, lang);
+
+        // Edit functionality
+        editButton.addEventListener('click', () => {
+            this.switchToEditMode(overlay, textContainer, editButton, img);
+        });
+
+        return overlay;
+    }
+
+    function switchToEditMode(overlay, textContainer, editButton, img) {
+        const textarea = document.createElement('textarea');
+        textarea.className = 'ocr-edit';
+        textarea.value = textContainer.textContent;
+        textarea.style.cssText = `
+            width: 100%;
+            height: 80px;
+            resize: vertical;
+            padding: 8px;
+            box-sizing: border-box;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            font-family: inherit;
+            font-size: 14px;
+        `;
+        textContainer.replaceWith(textarea);
+        textarea.focus();
+
+        // Create save button
+        const saveButton = document.createElement('button');
+        saveButton.className = 'save-btn';
+        saveButton.textContent = 'Save';
+        saveButton.style.cssText = `
+            display: block;
+            margin-top: 5px;
+            padding: 6px 12px;
+            background: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        `;
+        overlay.appendChild(saveButton);
+
+        // Create cancel button
+        const cancelButton = document.createElement('button');
+        cancelButton.className = 'cancel-btn';
+        cancelButton.textContent = 'Cancel';
+        cancelButton.style.cssText = `
+            display: block;
+            margin-top: 5px;
+            padding: 6px 12px;
+            background: #757575;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            margin-left: 5px;
+        `;
+        overlay.appendChild(cancelButton);
+
+        // Button container
+        const buttonContainer = document.createElement('div');
+        buttonContainer.style.display = 'flex';
+        buttonContainer.style.justifyContent = 'flex-start';
+        buttonContainer.style.gap = '5px';
+        buttonContainer.appendChild(saveButton);
+        buttonContainer.appendChild(cancelButton);
+        overlay.appendChild(buttonContainer);
+
+        // Remove edit button temporarily
+        editButton.style.display = 'none';
+
+        const saveHandler = () => {
+            const correctedText = textarea.value.trim();
+            const originalText = overlay.dataset.originalText;
+
+            // Update display
+            textContainer.textContent = correctedText;
+            textarea.replaceWith(textContainer);
+            buttonContainer.remove();
+            editButton.style.display = 'block';
+
+            // Send correction to backend if changed
+            if (correctedText !== textContainer.textContent) {
+                sendCorrection(img, overlay, correctedText, originalText);
+            }
+
+            // Update positioning after edit
+            positioningSystem.updateOverlayPosition(overlay);
+        };
+
+        const cancelHandler = () => {
+            textarea.replaceWith(textContainer);
+            buttonContainer.remove();
+            editButton.style.display = 'block';
+            positioningSystem.updateOverlayPosition(overlay);
+        };
+
+        saveButton.addEventListener('click', saveHandler);
+        cancelButton.addEventListener('click', cancelHandler);
+
+        textarea.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && e.ctrlKey) saveHandler();
+            if (e.key === 'Escape') cancelHandler();
+        });
+    }
+
+    // Send correction to backend
+    function sendCorrection(img, overlay, correctedText, originalText) {
+        const bbox = JSON.parse(overlay.dataset.bbox);
+        const lang = overlay.dataset.lang;
+
+        // Get image data from cache or fetch
+        let imageData = imageDataCache.get(img);
+
+        const sendRequest = (base64) => {
+            magiRequest(APP_CONFIG.MAGI_API.CORRECTION, {
+                image: base64,
+                bbox: bbox,
+                original_text: originalText,
+                corrected_text: correctedText,
+                lang: lang
+            }).then(response => {
+                console.log('Correction saved:', response);
+            }).catch(error => {
+                console.error('Failed to save correction:', error);
+            });
+        };
+
+        if (!imageData) {
+            // Get image data and cache it
+            getImageBase64(img).then(base64 => {
+                imageDataCache.set(img, base64);
+                sendRequest(base64);
+            }).catch(error => {
+                console.error('Failed to get image data for correction:', error);
+            });
+        } else {
+            sendRequest(imageData);
+        }
+    }
+
+    // Website structure analysis
+    async function analyzeWebsiteStructure() {
+        try {
+            const response = await magiRequestWithRetry(
+                APP_CONFIG.WEBSITE_STRUCTURE_API,
+                { url: window.location.href }
+            );
+
+            if (response.error) {
+                console.error('Website structure analysis failed:', response.error);
+                return;
+            }
+
+            // Store the structure data for use in overlay placement
+            window.magiWebsiteStructure = response;
+            console.log('Website structure analyzed:', response);
+
+            // Reprocess images with new structure data
+            document.querySelectorAll('img[data-magi-processed]').forEach(img => {
+                img.removeAttribute('data-magi-processed');
+            });
+
+            // If the app is active, process images again
+            if (SettingsManager.getActive() && window.magiAppInstance) {
+                window.magiAppInstance.processExistingImages();
+            }
+        } catch (error) {
+            console.error('Failed to analyze website structure:', error);
+        }
+    }
+
+    // Main Application
+    class MangaOCRApp {
+        constructor() {
+            this.processedImages = new WeakSet();
+            this.active = SettingsManager.getActive();
+            this.imageProcessor = new ImageProcessor(this);
+            this.observer = null;
+            this.lazyObserver = null;
+            this.cleanupInterval = null;
+            window.magiAppInstance = this;
+        }
+
+        async init() {
+            SettingsManager.init();
+            this.setupUI();
+            this.setupObservers();
+            this.setupCleanup();
+            positioningSystem.init();
+            connectionMonitor.startPeriodicChecks();
+
+            if (SettingsManager.getUseWebsiteStructure()) {
+                analyzeWebsiteStructure();
+            }
+
+            // Start processing after a short delay to ensure DOM is ready
+            setTimeout(() => {
+                this.processExistingImages();
+            }, 1000);
+        }
+
+        setupUI() {
+            // Remove existing control panel if exists
+            const existingPanel = document.getElementById('magi-control-panel');
+            if (existingPanel) existingPanel.remove();
+
+            const panel = document.createElement('div');
+            panel.id = 'magi-control-panel';
+            panel.style.cssText = `
+                position: fixed;
+                top: 10px;
+                right: 10px;
+                background: rgba(0,0,0,0.92);
+                color: white;
+                padding: 15px;
+                border-radius: 10px;
+                z-index: 100000;
+                width: ${APP_CONFIG.UI.CONTROL_PANEL_WIDTH}px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+                backdrop-filter: blur(10px);
+                border: 1px solid rgba(255,255,255,0.1);
+            `;
+
+            // Language options
+            let langOptions = '';
+            for (const [code, lang] of Object.entries(APP_CONFIG.LANGUAGES)) {
+                langOptions += `<option value="${code}" ${code === SettingsManager.getLanguage() ? 'selected' : ''}>
+                    ${lang.icon} ${lang.name}
+                </option>`;
+            }
+
+            // Reading order options
+            const readingOrder = SettingsManager.getReadingOrder();
+            const health = connectionMonitor.getHealth();
+
+            panel.innerHTML = `
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; border-bottom: 1px solid rgba(255,255,255,0.2); padding-bottom: 10px;">
+                    <h3 style="margin:0; font-size:16px; font-weight:600; color: #64b5f6;">
+                        <i class="fas fa-book-open"></i> Manga MAGI OCR
+                    </h3>
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <div style="width: 8px; height: 8px; border-radius: 50%; background: ${health.healthy ? '#4CAF50' : '#f44336'};"
+                             title="${health.healthy ? 'Backend connected' : 'Backend disconnected'}"></div>
+                        <button id="magi-toggle" class="toggle-btn" style="
+                            background: ${this.active ? '#4CAF50' : '#f44336'};
+                            border: none;
+                            color: white;
+                            padding: 6px 12px;
+                            border-radius: 4px;
+                            cursor: pointer;
+                            font-size: 12px;
+                            font-weight: 500;
+                        ">
+                            ${this.active ? 'ON' : 'OFF'}
+                        </button>
+                    </div>
+                </div>
+
+                <div style="margin-bottom: 12px;">
+                    <label style="display: block; margin-bottom: 6px; font-size: 13px; font-weight: 500;">
+                        <input type="checkbox" id="use-website-structure" ${SettingsManager.getUseWebsiteStructure() ? 'checked' : ''}>
+                        Use Website Structure Analysis
+                    </label>
+                    <button id="analyze-structure" style="width:100%; padding:6px; margin-top:6px; font-size:11px; ${SettingsManager.getUseWebsiteStructure() ? '' : 'display:none;'}">
+                        Analyze Current Page
+                    </button>
+                </div>
+
+                <div style="margin-bottom: 12px;">
+                    <label style="display: block; margin-bottom: 6px; font-size: 13px; font-weight: 500;">
+                        <i class="fas fa-language"></i> Language:
+                    </label>
+                    <select id="lang-select" style="
+                        width: 100%;
+                        padding: 8px;
+                        border-radius: 4px;
+                        background: #2d2d2d;
+                        color: white;
+                        border: 1px solid #555;
+                        font-size: 12px;
+                    ">
+                        ${langOptions}
+                    </select>
+                </div>
+
+                <div style="margin-bottom: 12px;">
+                    <label style="display: block; margin-bottom: 6px; font-size: 13px; font-weight: 500;">
+                        <i class="fas fa-sort"></i> Reading Order:
+                    </label>
+                    <div style="display: flex; gap: 8px;">
+                        <button id="order-manga" class="order-btn ${readingOrder === 'manga' ? 'active' : ''}"
+                            style="flex:1; padding:8px; background: ${readingOrder === 'manga' ? '#4CAF50' : '#444'}; border:none; color:white; border-radius:4px; font-size:11px;">
+                            Manga (右→左)
+                        </button>
+                        <button id="order-western" class="order-btn ${readingOrder === 'western' ? 'active' : ''}"
+                            style="flex:1; padding:8px; background: ${readingOrder === 'western' ? '#4CAF50' : '#444'}; border:none; color:white; border-radius:4px; font-size:11px;">
+                            Western (左→右)
+                        </button>
+                    </div>
+                </div>
+
+                <div style="margin-bottom: 15px;">
+                    <label style="display: block; margin-bottom: 6px; font-size: 13px; font-weight: 500;">
+                        <i class="fas fa-sliders-h"></i> Confidence:
+                        <span id="conf-value">${SettingsManager.getConfidence()}</span>%
+                    </label>
+                    <input type="range" id="conf-slider" min="0" max="100"
+                           value="${SettingsManager.getConfidence()}" style="width:100%;">
+                </div>
+
+                <div style="display: flex; gap: 8px; margin-bottom: 10px;">
+                    <button id="magi-process-all" style="
+                        flex: 1;
+                        padding: 8px;
+                        background: #2196F3;
+                        color: white;
+                        border: none;
+                        border-radius: 4px;
+                        cursor: pointer;
+                        font-weight: 500;
+                        font-size: 12px;
+                    ">
+                        <i class="fas fa-bolt"></i> Process All
+                    </button>
+                    <button id="clear-overlays" style="
+                        flex: 1;
+                        padding: 8px;
+                        background: #ff9800;
+                        color: white;
+                        border: none;
+                        border-radius: 4px;
+                        cursor: pointer;
+                        font-weight: 500;
+                        font-size: 12px;
+                    ">
+                        <i class="fas fa-trash"></i> Clear
+                    </button>
+                </div>
+
+                <div style="font-size: 10px; color: #aaa; text-align: center; margin-top: 10px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 8px;">
+                    Backend: ${health.healthy ? 'Connected' : 'Disconnected'}
+                    ${health.averageResponseTime > 0 ? `• Avg: ${health.averageResponseTime.toFixed(0)}ms` : ''}
+                </div>
+            `;
+
+            document.body.appendChild(panel);
+
+            // Event listeners
+            document.getElementById('magi-toggle').addEventListener('click', () => this.toggleOCR());
+            document.getElementById('lang-select').addEventListener('change', (e) => {
+                SettingsManager.setLanguage(e.target.value);
+                this.processExistingImages();
+            });
+            document.getElementById('conf-slider').addEventListener('input', (e) => {
+                const value = e.target.value;
+                document.getElementById('conf-value').textContent = value;
+                SettingsManager.setConfidence(parseInt(value));
+            });
+            document.getElementById('magi-process-all').addEventListener('click', () => {
+                this.processAllImages();
+            });
+            document.getElementById('clear-overlays').addEventListener('click', () => {
+                this.removeAllOverlays();
+            });
+            document.getElementById('order-manga').addEventListener('click', () => {
+                SettingsManager.setReadingOrder('manga');
+                this.updateReadingOrderButtons();
+                this.processExistingImages();
+            });
+            document.getElementById('order-western').addEventListener('click', () => {
+                SettingsManager.setReadingOrder('western');
+                this.updateReadingOrderButtons();
+                this.processExistingImages();
+            });
+            document.getElementById('use-website-structure').addEventListener('change', (e) => {
+                SettingsManager.setUseWebsiteStructure(e.target.checked);
+                document.getElementById('analyze-structure').style.display = e.target.checked ? 'block' : 'none';
+                if (e.target.checked) {
+                    analyzeWebsiteStructure();
+                }
+            });
+            document.getElementById('analyze-structure').addEventListener('click', () => {
+                analyzeWebsiteStructure();
+            });
+        }
+
+        updateReadingOrderButtons() {
+            const order = SettingsManager.getReadingOrder();
+            document.getElementById('order-manga').style.background = order === 'manga' ? '#4CAF50' : '#444';
+            document.getElementById('order-western').style.background = order === 'western' ? '#4CAF50' : '#444';
+        }
+
+        async toggleOCR() {
+            this.active = !this.active;
+            SettingsManager.setActive(this.active);
+            const btn = document.getElementById('magi-toggle');
+            btn.textContent = this.active ? 'ON' : 'OFF';
+            btn.style.background = this.active ? '#4CAF50' : '#f44336';
+
+            if (this.active) {
+                await this.enableOCR();
+            } else {
+                this.disableOCR();
+            }
+        }
+
+        async enableOCR() {
+            this.setupObservers();
+            this.processExistingImages();
+        }
+
+        disableOCR() {
+            this.removeAllOverlays();
+            this.processedImages = new WeakSet();
+            if (this.observer) this.observer.disconnect();
+            if (this.lazyObserver) this.lazyObserver.disconnect();
+            this.imageProcessor.cleanup();
+        }
+
+        setupObservers() {
+            // Disconnect existing observers
+            if (this.observer) this.observer.disconnect();
+            if (this.lazyObserver) this.lazyObserver.disconnect();
+
+            // Mutation observer for new images
+            this.observer = new MutationObserver((mutations) => {
+                for (const mutation of mutations) {
+                    for (const node of mutation.addedNodes) {
+                        if (node.nodeType === Node.ELEMENT_NODE) {
+                            if (node.nodeName === 'IMG') {
+                                this.imageProcessor.scheduleProcessing(node);
+                            }
+                            const images = node.querySelectorAll ? node.querySelectorAll('img') : [];
+                            for (const img of images) {
+                                this.imageProcessor.scheduleProcessing(img);
+                            }
+                        }
+                    }
+                }
+            });
+
+            this.observer.observe(document.body, {
+                childList: true,
+                subtree: true
+            });
+
+            // Lazy loading observer
+            this.lazyObserver = new IntersectionObserver((entries) => {
+                for (const entry of entries) {
+                    if (entry.isIntersecting) {
+                        this.imageProcessor.scheduleProcessing(entry.target, 'high');
+                    }
+                }
+            }, {
+                rootMargin: APP_CONFIG.PROCESSING.LAZY_LOAD_MARGIN,
+                threshold: 0.1
+            });
+
+            // Observe all existing images
+            document.querySelectorAll('img').forEach(img => {
+                this.lazyObserver.observe(img);
+            });
+        }
+
+        setupCleanup() {
+            // Periodic cache cleanup
+            this.cleanupInterval = setInterval(() => {
+                imageDataCache.cleanup();
+            }, APP_CONFIG.CACHE.CLEANUP_INTERVAL);
+
+            // Cleanup on page unload
+            window.addEventListener('beforeunload', () => {
+                this.destroy();
+            });
+        }
+
+        async processAllImages() {
+            const images = document.querySelectorAll('img:not([data-magi-processed])');
+            console.log(`Processing ${images.length} images...`);
+
+            for (const img of images) {
+                await this.imageProcessor.scheduleProcessing(img, 'high');
+                // Small delay to prevent overwhelming the backend
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+        }
+
+        processExistingImages() {
+            if (!this.active) return;
+
+            const images = document.querySelectorAll('img');
+            images.forEach(img => {
+                if (!img.hasAttribute('data-magi-processed') && img.complete && img.naturalHeight > 0) {
+                    this.imageProcessor.scheduleProcessing(img);
+                }
+            });
+        }
+
+        removeAllOverlays() {
+            document.querySelectorAll('.ocr-overlay').forEach(el => el.remove());
+            document.querySelectorAll('[data-magi-processed]').forEach(img => {
+                img.removeAttribute('data-magi-processed');
+            });
+            this.processedImages = new WeakSet();
+        }
+
+        destroy() {
+            this.disableOCR();
+            positioningSystem.destroy();
+            connectionMonitor.stopPeriodicChecks();
+
+            if (this.cleanupInterval) {
+                clearInterval(this.cleanupInterval);
+            }
+
+            // Remove control panel
+            const panel = document.getElementById('magi-control-panel');
+            if (panel) panel.remove();
+        }
+    }
+
+    // Add enhanced styles
+    GM_addStyle(`
+        .magi-container {
+            position: relative !important;
+            display: block !important;
+            overflow: visible !important;
+            z-index: 9999 !important;
+        }
+
+        .ocr-overlay {
+            position: absolute;
+            user-select: text;
+            background: rgba(255, 255, 255, 0.95) !important;
+            color: #222 !important;
+            padding: 10px 12px;
+            border-radius: 8px;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+            z-index: 10000 !important;
+            border: 1px solid rgba(0,0,0,0.1) !important;
+            line-height: 1.5;
+            pointer-events: auto;
+            box-sizing: border-box;
+            max-width: ${APP_CONFIG.UI.OVERLAY_MAX_WIDTH}px;
+            overflow: visible !important;
+            font-weight: 500;
+            font-family: 'Noto Sans JP', 'Yu Gothic', 'Meiryo', 'MS PGothic', 'Segoe UI', Arial, sans-serif !important;
+            padding-bottom: 30px;
+            transition: opacity 0.2s ease, transform 0.2s ease;
+            will-change: transform, opacity;
+            backdrop-filter: blur(5px);
+        }
+
+        .ocr-overlay:hover {
+            box-shadow: 0 6px 20px rgba(0,0,0,0.2);
+            transform: translateY(-1px);
+        }
+
+        .ocr-text {
+            font-size: 14px;
+            word-break: keep-all;
+            white-space: normal;
+            padding: 4px 6px;
+            font-family: inherit !important;
+            line-height: 1.4;
+        }
+
+        .ocr-edit {
+            width: 100%;
+            min-height: 60px;
+            padding: 8px;
+            box-sizing: border-box;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            font-family: inherit;
+            font-size: 14px;
+            resize: vertical;
+        }
+
+        .save-btn, .cancel-btn {
+            padding: 6px 12px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        .save-btn {
+            background: #4CAF50;
+            color: white;
+        }
+
+        .save-btn:hover {
+            background: #45a049;
+        }
+
+        .cancel-btn {
+            background: #757575;
+            color: white;
+        }
+
+        .cancel-btn:hover {
+            background: #666;
+        }
+
+        .edit-btn {
+            position: absolute;
+            top: 4px;
+            right: 4px;
+            background: rgba(255,255,255,0.9);
+            border: 1px solid #ddd;
+            border-radius: 3px;
+            cursor: pointer;
+            padding: 3px 6px;
+            z-index: 10;
+            opacity: 0.7;
+            transition: opacity 0.2s, background 0.2s;
+            font-size: 10px;
+        }
+
+        .edit-btn:hover {
+            opacity: 1;
+            background: white;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+
+        .speaker-badge {
+            color: #d32f2f;
+            font-weight: bold;
+            margin-bottom: 6px;
+            font-size: 11px;
+            background: rgba(255,255,255,0.9);
+            padding: 2px 6px;
+            border-radius: 3px;
+            display: inline-block;
+            border: 1px solid rgba(211,47,47,0.2);
+        }
+
+        #magi-control-panel {
+            z-index: 100000 !important;
+            transition: transform 0.3s ease;
+        }
+
+        #magi-control-panel:hover {
+            transform: translateX(-5px);
+        }
+
+        /* Website-specific fixes */
+        .entry-content, .reader-area, .chapter-content {
+            overflow: visible !important;
+            position: relative !important;
+            z-index: auto !important;
+        }
+
+        .separator, .wp-block-image, .page-container {
+            position: relative !important;
+            z-index: auto !important;
+        }
+
+        /* Mobile responsiveness */
+        @media (max-width: 768px) {
+            .ocr-overlay {
+                font-size: 13px;
+                padding: 8px 10px;
+                max-width: 250px;
+            }
+
+            #magi-control-panel {
+                width: 260px;
+                right: 5px;
+                top: 5px;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .ocr-overlay {
+                font-size: 12px;
+                padding: 6px 8px;
+                max-width: 200px;
+            }
+
+            #magi-control-panel {
+                width: 240px;
+                padding: 10px;
+            }
+        }
+
+        /* Animation for new overlays */
+        @keyframes overlayFadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .ocr-overlay {
+            animation: overlayFadeIn 0.3s ease-out;
+        }
+    `);
+
+    // Initialize application
+    window.addEventListener('load', () => {
+        // Add Font Awesome for icons
+        if (!document.querySelector('link[href*="font-awesome"]')) {
+            const faLink = document.createElement('link');
+            faLink.rel = 'stylesheet';
+            faLink.href = 'https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css';
+            document.head.appendChild(faLink);
+        }
+
+        // Initialize app after a short delay to ensure styles are loaded
+        setTimeout(() => {
+            const app = new MangaOCRApp();
+            app.init();
+        }, 100);
+    });
+
+    // Export for debugging
+    window.MangaOCRApp = MangaOCRApp;
+})();
